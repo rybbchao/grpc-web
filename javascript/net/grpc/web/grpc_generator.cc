@@ -24,6 +24,7 @@
 #include <algorithm>
 
 using google::protobuf::Descriptor;
+using google::protobuf::EnumDescriptor;
 using google::protobuf::FieldDescriptor;
 using google::protobuf::FileDescriptor;
 using google::protobuf::MethodDescriptor;
@@ -196,6 +197,119 @@ string ToUpperCamel(const std::vector<string>& words) {
   return result;
 }
 
+// Returns the alias we assign to the module of the given .proto filename
+// when importing.
+string ModuleAlias(const string& filename) {
+  // This scheme could technically cause problems if a file includes any 2 of:
+  //   foo/bar_baz.proto
+  //   foo_bar_baz.proto
+  //   foo_bar/baz.proto
+  //
+  // We'll worry about this problem if/when we actually see it.  This name isn't
+  // exposed to users so we can change it later if we need to.
+  string basename = StripProto(filename);
+  ReplaceCharacters(&basename, "-", '$');
+  ReplaceCharacters(&basename, "/", '_');
+  ReplaceCharacters(&basename, ".", '_');
+  return basename + "_pb";
+}
+
+string JSMessageType(const Descriptor *desc, const FileDescriptor *file) {
+    string result;
+    if (desc->file() != file) {
+      result = ModuleAlias(desc->file()->name());
+    }
+    result += StripPrefixString(desc->full_name(), desc->file()->package());
+    if (!result.empty() && result[0] == '.') {
+      result = result.substr(1);
+    }
+
+    return result;
+}
+
+string JSFieldType(const FieldDescriptor *desc, const FileDescriptor *file)
+{
+  string js_field_type;
+  switch (desc->type())
+  {
+  case FieldDescriptor::TYPE_DOUBLE:
+  case FieldDescriptor::TYPE_FLOAT:
+  case FieldDescriptor::TYPE_INT32:
+  case FieldDescriptor::TYPE_UINT32:
+  case FieldDescriptor::TYPE_INT64:
+  case FieldDescriptor::TYPE_UINT64:
+  case FieldDescriptor::TYPE_FIXED32:
+  case FieldDescriptor::TYPE_FIXED64:
+  case FieldDescriptor::TYPE_SINT32:
+  case FieldDescriptor::TYPE_SINT64:
+  case FieldDescriptor::TYPE_SFIXED32:
+  case FieldDescriptor::TYPE_SFIXED64:
+    js_field_type = "number";
+    break;
+  case FieldDescriptor::TYPE_BOOL:
+    js_field_type = "boolean";
+    break;
+  case FieldDescriptor::TYPE_STRING:
+    js_field_type = "string";
+    break;
+  case FieldDescriptor::TYPE_ENUM:
+    js_field_type = StripPrefixString(desc->enum_type()->full_name(), desc->enum_type()->file()->package());
+    if (!js_field_type.empty() && js_field_type[0] == '.') {
+      js_field_type = js_field_type.substr(1);
+    }
+    break;
+  case FieldDescriptor::TYPE_MESSAGE:
+    if (desc->is_map()) {
+      string key_type = JSFieldType(desc->message_type()->field(0), file);
+      string value_type = JSFieldType(desc->message_type()->field(1), file);
+      return "jspb.Map<" + key_type + ", " + value_type + ">";
+    }
+    js_field_type = JSMessageType(desc->message_type(), file);
+    break;
+  default:
+    js_field_type = "{}";
+    break;
+  }
+  if (desc->is_repeated())
+  {
+    js_field_type += "[]";
+  }
+  return js_field_type;
+}
+
+string JSFieldName(const FieldDescriptor *desc)
+{
+  string js_field_name = ToUpperCamel(ParseLowerUnderscore(desc->name()));
+  if (desc->is_map()) {
+    js_field_name += "Map";
+  } else if (desc->is_repeated()) {
+    js_field_name += "List";
+  }
+  return js_field_name;
+}
+
+// Like ToUpperCamel except the first letter is not converted.
+string ToCamelCase(const std::vector<string>& words)
+{
+  if (words.size() == 0) {
+      return "";
+  }
+  string result = words[0];
+  return result + ToUpperCamel(std::vector<string>(words.begin()+1, words.begin()+words.size()));
+}
+
+// Like JSFieldName, but with first letter not uppercased
+string CamelCaseJSFieldName(const FieldDescriptor *desc)
+{
+  string js_field_name = ToCamelCase(ParseLowerUnderscore(desc->name()));
+  if (desc->is_map()) {
+    js_field_name += "Map";
+  } else if (desc->is_repeated()) {
+    js_field_name += "List";
+  }
+  return js_field_name;
+}
+
 // Returns the name of the message with a leading dot and taking into account
 // nesting, for example ".OuterMessage.InnerMessage", or returns empty if
 // descriptor is null. This function does not handle namespacing, only message
@@ -235,21 +349,15 @@ string GetRootPath(const string& from_filename, const string& to_filename) {
   return result;
 }
 
-// Returns the alias we assign to the module of the given .proto filename
-// when importing.
-string ModuleAlias(const string& filename) {
-  // This scheme could technically cause problems if a file includes any 2 of:
-  //   foo/bar_baz.proto
-  //   foo_bar_baz.proto
-  //   foo_bar/baz.proto
-  //
-  // We'll worry about this problem if/when we actually see it.  This name isn't
-  // exposed to users so we can change it later if we need to.
-  string basename = StripProto(filename);
-  ReplaceCharacters(&basename, "-", '$');
-  ReplaceCharacters(&basename, "/", '_');
-  ReplaceCharacters(&basename, ".", '_');
-  return basename + "_pb";
+// Returns the basename of a file.
+string GetBasename(string filename)
+{
+  size_t last_slash = filename.find_last_of('/');
+  if (last_slash != string::npos)
+  {
+    return filename.substr(last_slash + 1);
+  }
+  return filename;
 }
 
 /* Finds all message types used in all services in the file, and returns them
@@ -264,10 +372,8 @@ std::map<string, const Descriptor*> GetAllMessages(const FileDescriptor* file) {
          method_index < service->method_count();
          ++method_index) {
       const MethodDescriptor *method = service->method(method_index);
-      const Descriptor *input_type = method->input_type();
-      const Descriptor *output_type = method->output_type();
-      message_types[input_type->full_name()] = input_type;
-      message_types[output_type->full_name()] = output_type;
+      message_types[method->input_type()->full_name()] = method->input_type();
+      message_types[method->output_type()->full_name()] = method->output_type();
     }
   }
 
@@ -319,12 +425,7 @@ void PrintCommonJsMessagesDeps(Printer* printer, const FileDescriptor* file) {
   }
 
   // need to import the messages from our own file
-  string filename = StripProto(file->name());
-  size_t last_slash = filename.find_last_of('/');
-  if (last_slash != string::npos) {
-    filename = filename.substr(last_slash + 1);
-  }
-  vars["filename"] = filename;
+  vars["filename"] = GetBasename(StripProto(file->name()));
 
   if (!package.empty()) {
     printer->Print(
@@ -337,21 +438,61 @@ void PrintCommonJsMessagesDeps(Printer* printer, const FileDescriptor* file) {
   }
 }
 
+void PrintES6Dependencies(Printer* printer, const FileDescriptor *file) {
+  std::map<string, string> vars;
+
+  for (int i = 0; i < file->dependency_count(); i++) {
+    const string& name = file->dependency(i)->name();
+    vars["alias"] = ModuleAlias(name);
+    vars["dep_filename"] = GetRootPath(file->name(), name) + StripProto(name);
+    // we need to give each cross-file import an alias
+    printer->Print(
+        vars,
+        "import * as $alias$ from '$dep_filename$_pb';\n");
+  }
+
+  if (file->dependency_count() != 0) {
+    printer->Print("\n");
+  }
+}
+
 void PrintES6Imports(Printer* printer, const FileDescriptor* file) {
   std::map<string, string> vars;
+
+  printer->Print("import * as grpcWeb from 'grpc-web';\n\n");
+  PrintES6Dependencies(printer, file);
+
   std::map<string, const Descriptor*> messages = GetAllMessages(file);
-  vars["base_name"] = StripProto(file->name());
-  printer->Print("import * as grpcWeb from 'grpc-web';\n");
-  printer->Print("import {\n");
-  printer->Indent();
-  for (std::map<string, const Descriptor*>::iterator it = messages.begin();
-       it != messages.end(); it++) {
-    vars["class_name"] = it->second->name();
-    printer->Print(vars, "$class_name$");
-    if (std::next(it) != messages.end()) {
-      printer->Print(",\n");
+  for (std::map<string, const Descriptor*>::iterator it = messages.begin(); it != messages.end();) {
+    if (it->second->file() != file) {
+      it = messages.erase(it);
+    } else {
+      it++;
     }
   }
+
+  if (messages.empty()) {
+    return;
+  }
+
+  std::map<string, const Descriptor*>::iterator it = messages.begin();
+  vars["base_name"] = GetBasename(StripProto(file->name()));
+  vars["class_name"] = it->second->name();
+
+  if (messages.size() == 1) {
+    printer->Print(vars, "import {$class_name$} from './$base_name$_pb';\n\n");
+    return;
+  }
+
+  printer->Print("import {\n");
+  printer->Indent();
+  printer->Print(vars, "$class_name$");
+
+  for (it++; it != messages.end(); it++) {
+    vars["class_name"] = it->second->name();
+    printer->Print(vars, ",\n$class_name$");
+  }
+
   printer->Outdent();
   printer->Print(vars, "} from './$base_name$_pb';\n\n");
 }
@@ -369,11 +510,11 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
     printer->Print(
         "client_: grpcWeb.AbstractClientBase;\n"
         "hostname_: string;\n"
-        "credentials_: {};\n"
-        "options_: { [s: string]: {}; };\n\n"
+        "credentials_: null | { [index: string]: string; };\n"
+        "options_: null | { [index: string]: string; };\n\n"
         "constructor (hostname: string,\n"
-        "             credentials: {},\n"
-        "             options: { [s: string]: {}; }) {\n");
+        "             credentials: null | { [index: string]: string; },\n"
+        "             options: null | { [index: string]: string; }) {\n");
     printer->Indent();
     printer->Print("if (!options) options = {};\n");
     if (vars["mode"] == GetModeVar(Mode::GRPCWEB)) {
@@ -392,8 +533,8 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
       const MethodDescriptor* method = service->method(method_index);
       vars["js_method_name"] = LowercaseFirstLetter(method->name());
       vars["method_name"] = method->name();
-      vars["input_type"] = method->input_type()->name();
-      vars["output_type"] = method->output_type()->name();
+      vars["input_type"] = JSMessageType(method->input_type(), file);
+      vars["output_type"] = JSMessageType(method->output_type(), file);
       vars["serialize_func_name"] = GetSerializeMethodName(vars["mode"]);
       vars["deserialize_func_name"] = GetDeserializeMethodName(vars["mode"]);
       if (!method->client_streaming()) {
@@ -414,14 +555,14 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
           printer->Indent();
           printer->Print(vars,
                          "request: $input_type$,\n"
-                         "metadata: grpcWeb.Metadata) {\n");
+                         "metadata?: grpcWeb.Metadata) {\n");
           printer->Print(vars, "return this.client_.serverStreaming(\n");
           printer->Indent();
           printer->Print(vars,
                          "this.hostname_ +\n"
                          "  '/$package_dot$$service_name$/$method_name$',\n"
                          "request,\n"
-                         "metadata,\n"
+                         "metadata || {},\n"
                          "this.methodInfo$method_name$);\n");
           printer->Outdent();
           printer->Outdent();
@@ -431,7 +572,7 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
           printer->Indent();
           printer->Print(vars,
                          "request: $input_type$,\n"
-                         "metadata: grpcWeb.Metadata,\n"
+                         "metadata: grpcWeb.Metadata | null,\n"
                          "callback: (err: grpcWeb.Error,\n"
                          "           response: $output_type$) => void) {\n");
           printer->Print(vars, "return this.client_.rpcCall(\n");
@@ -440,7 +581,7 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
                          "this.hostname_ +\n"
                          "  '/$package_dot$$service_name$/$method_name$',\n"
                          "request,\n"
-                         "metadata,\n"
+                         "metadata || {},\n"
                          "this.methodInfo$method_name$,\n"
                          "callback);\n");
           printer->Outdent();
@@ -454,45 +595,58 @@ void PrintTypescriptFile(Printer* printer, const FileDescriptor* file,
   }
 }
 
-void PrintGrpcWebDtsFile(Printer* printer, const FileDescriptor* file) {
-  PrintES6Imports(printer, file);
+void PrintGrpcWebDtsClientClass(Printer* printer, const FileDescriptor* file, const string &client_type) {
   std::map<string, string> vars;
+  vars["client_type"] = client_type;
   for (int service_index = 0; service_index < file->service_count();
        ++service_index) {
     printer->Print("export class ");
     const ServiceDescriptor* service = file->service(service_index);
     vars["service_name"] = service->name();
-    printer->Print(vars, "$service_name$Client {\n");
+    printer->Print(vars, "$service_name$$client_type$ {\n");
     printer->Indent();
     printer->Print(
         "constructor (hostname: string,\n"
-        "             credentials: {},\n"
-        "             options: { [s: string]: {}; });\n\n");
+        "             credentials: null | { [index: string]: string; },\n"
+        "             options: null | { [index: string]: string; });\n\n");
     for (int method_index = 0; method_index < service->method_count();
          ++method_index) {
       const MethodDescriptor* method = service->method(method_index);
       vars["js_method_name"] = LowercaseFirstLetter(method->name());
-      vars["input_type"] = method->input_type()->name();
-      vars["output_type"] = method->output_type()->name();
+      vars["input_type"] = JSMessageType(method->input_type(), file);
+      vars["output_type"] = JSMessageType(method->output_type(), file);
       if (!method->client_streaming()) {
         if (method->server_streaming()) {
           printer->Print(vars, "$js_method_name$(\n");
           printer->Indent();
           printer->Print(vars,
                          "request: $input_type$,\n"
-                         "metadata: grpcWeb.Metadata\n");
+                         "metadata?: grpcWeb.Metadata\n");
           printer->Outdent();
-          printer->Print("): grpcWeb.ClientReadableStream;\n\n");
-        } else {
-          printer->Print(vars, "$js_method_name$(\n");
-          printer->Indent();
           printer->Print(vars,
-                         "request: $input_type$,\n"
-                         "metadata: grpcWeb.Metadata,\n"
-                         "callback: (err: grpcWeb.Error,\n"
-                         "           response: $output_type$) => void\n");
-          printer->Outdent();
-          printer->Print("): grpcWeb.ClientReadableStream;\n\n");
+                         "): grpcWeb.ClientReadableStream<$output_type$>;\n\n");
+        } else {
+          if (vars["client_type"] == "PromiseClient") {
+            printer->Print(vars, "$js_method_name$(\n");
+            printer->Indent();
+            printer->Print(vars,
+                           "request: $input_type$,\n"
+                           "metadata?: grpcWeb.Metadata\n");
+            printer->Outdent();
+            printer->Print(vars,
+                           "): Promise<$output_type$>;\n\n");
+          } else {
+            printer->Print(vars, "$js_method_name$(\n");
+            printer->Indent();
+            printer->Print(vars,
+                           "request: $input_type$,\n"
+                           "metadata: grpcWeb.Metadata | undefined,\n"
+                           "callback: (err: grpcWeb.Error,\n"
+                           "           response: $output_type$) => void\n");
+            printer->Outdent();
+            printer->Print(vars,
+                           "): grpcWeb.ClientReadableStream<$output_type$>;\n\n");
+          }
         }
       }
     }
@@ -501,58 +655,118 @@ void PrintGrpcWebDtsFile(Printer* printer, const FileDescriptor* file) {
   }
 }
 
-void PrintProtoDtsFile(Printer* printer, const FileDescriptor* file) {
-  std::map<string, string> vars;
-  std::map<string, const Descriptor*> messages = GetAllMessages(file);
+void PrintGrpcWebDtsFile(Printer* printer, const FileDescriptor* file) {
+  PrintES6Imports(printer, file);
+  PrintGrpcWebDtsClientClass(printer, file, "Client");
+  PrintGrpcWebDtsClientClass(printer, file, "PromiseClient");
+}
 
-  for (std::map<string, const Descriptor*>::iterator it = messages.begin();
-       it != messages.end(); it++) {
-    vars["class_name"] = it->second->name();
-    printer->Print(vars, "export class $class_name$ {\n");
-    printer->Indent();
-    printer->Print("constructor ();\n");
-    for (int i = 0; i < it->second->field_count(); i++) {
-      vars["js_field_name"] =
-          ToUpperCamel(ParseLowerUnderscore(it->second->field(i)->name()));
-      string js_field_type = "";
-      switch (it->second->field(i)->type()) {
-        case FieldDescriptor::TYPE_DOUBLE:
-        case FieldDescriptor::TYPE_FLOAT:
-        case FieldDescriptor::TYPE_INT32:
-        case FieldDescriptor::TYPE_UINT32:
-        case FieldDescriptor::TYPE_INT64:
-        case FieldDescriptor::TYPE_UINT64:
-        case FieldDescriptor::TYPE_FIXED32:
-        case FieldDescriptor::TYPE_FIXED64:
-        case FieldDescriptor::TYPE_SINT32:
-        case FieldDescriptor::TYPE_SINT64:
-        case FieldDescriptor::TYPE_SFIXED32:
-        case FieldDescriptor::TYPE_SFIXED64:
-          js_field_type = "number";
-          break;
-        case FieldDescriptor::TYPE_BOOL:
-          js_field_type = "boolean";
-          break;
-        case FieldDescriptor::TYPE_STRING:
-          js_field_type = "string";
-          break;
-        default:
-          js_field_type = "{}";
-          break;
+void PrintProtoDtsEnum(Printer *printer, const EnumDescriptor *desc)
+{
+  std::map<string, string> vars;
+  vars["enum_name"] = desc->name();
+
+  printer->Print(vars, "export enum $enum_name$ { \n");
+  printer->Indent();
+  for (int i = 0; i < desc->value_count(); i++)
+  {
+    vars["value_name"] = desc->value(i)->name();
+    vars["value_number"] = std::to_string(desc->value(i)->number());
+    printer->Print(vars, "$value_name$ = $value_number$,\n");
+  }
+  printer->Outdent();
+  printer->Print("}\n");
+}
+
+void PrintProtoDtsMessage(Printer *printer, const Descriptor *desc, const FileDescriptor *file)
+{
+  string class_name = desc->name();
+  std::map<string, string> vars;
+  vars["class_name"] = class_name;
+
+  printer->Print(vars, "export class $class_name$ extends jspb.Message {\n");
+  printer->Indent();
+  printer->Print("constructor ();\n");
+  for (int i = 0; i < desc->field_count(); i++) {
+    const FieldDescriptor* field = desc->field(i);
+    vars["js_field_name"] = JSFieldName(field);
+    vars["js_field_type"] = JSFieldType(field, file);
+    if (field->type() != FieldDescriptor::TYPE_MESSAGE) {
+      printer->Print(vars, "get$js_field_name$(): $js_field_type$;\n");
+    } else {
+      printer->Print(vars, "get$js_field_name$(): $js_field_type$ | undefined;\n");
+    }
+    if (field->type() != FieldDescriptor::TYPE_MESSAGE) {
+      printer->Print(vars, "set$js_field_name$(value: $js_field_type$): void;\n");
+    } else if (!field->is_map()) {
+      printer->Print(vars, "set$js_field_name$(value?: $js_field_type$): void;\n");
+    }
+    if (field->type() == FieldDescriptor::TYPE_MESSAGE || field->is_repeated()) {
+      printer->Print(vars, "clear$js_field_name$(): void;\n");
+    }
+  }
+  printer->Print(vars,
+                "serializeBinary(): Uint8Array;\n"
+                "toObject(includeInstance?: boolean): $class_name$.AsObject;\n"
+                "static toObject(includeInstance: boolean, msg: $class_name$): $class_name$.AsObject;\n"
+                "static serializeBinaryToWriter(message: $class_name$, writer: jspb.BinaryWriter): void;\n"
+                "static deserializeBinary(bytes: Uint8Array): $class_name$;\n"
+                "static deserializeBinaryFromReader(message: $class_name$, reader: jspb.BinaryReader): $class_name$;\n");
+  printer->Outdent();
+  printer->Print("}\n\n");
+
+  printer->Print(vars, "export namespace $class_name$ {\n");
+  printer->Indent();
+  printer->Print("export type AsObject = {\n");
+  printer->Indent();
+  for (int i = 0; i < desc->field_count(); i++) {
+    const FieldDescriptor* field = desc->field(i);
+    vars["js_field_name"] = CamelCaseJSFieldName(field);
+    if (field->type() != FieldDescriptor::TYPE_MESSAGE) {
+      vars["js_field_type"] = JSFieldType(field, file);
+      printer->Print(vars, "$js_field_name$: $js_field_type$;\n");
+    } else {
+      string js_field_type = JSMessageType(field->message_type(), file) + ".AsObject";
+      if (field->is_repeated()) {
+        js_field_type += "[]";
       }
       if (it->second->field(i)->is_repeated()) {
         vars["js_field_name"] += "List";
         js_field_type += "[]";
       }
       vars["js_field_type"] = js_field_type;
-      printer->Print(vars, "get$js_field_name$(): $js_field_type$;\n");
-      printer->Print(vars, "set$js_field_name$(a: $js_field_type$): void;\n");
+      printer->Print(vars, "$js_field_name$?: $js_field_type$;\n");
     }
-    printer->Print(vars,
-                   "serializeBinary(): Uint8Array;\n"
-                   "static deserializeBinary: (bytes: {}) => $class_name$;\n");
-    printer->Outdent();
-    printer->Print("}\n\n");
+  }
+  printer->Outdent();
+  printer->Print("}\n");
+
+  for (int i = 0; i < desc->nested_type_count(); i++) {
+    printer->Print("\n");
+    PrintProtoDtsMessage(printer, desc->nested_type(i), file);
+  }
+
+  for (int i = 0; i < desc->enum_type_count(); i++) {
+    printer->Print("\n");
+    PrintProtoDtsEnum(printer, desc->enum_type(i));
+  }
+
+  printer->Outdent();
+  printer->Print("}\n\n");
+
+}
+
+void PrintProtoDtsFile(Printer *printer, const FileDescriptor *file)
+{
+  printer->Print("import * as jspb from \"google-protobuf\"\n\n");
+  PrintES6Dependencies(printer, file);
+
+  for (int i = 0; i < file->message_type_count(); i++) {
+    PrintProtoDtsMessage(printer, file->message_type(i), file);
+  }
+
+  for (int i = 0; i < file->enum_type_count(); i++) {
+    PrintProtoDtsEnum(printer, file->enum_type(i));
   }
 }
 
@@ -646,7 +860,7 @@ void PrintMethodInfo(Printer* printer, std::map<string, string> vars) {
       " *   !proto.$in$,\n"
       " *   !proto.$out$>}\n"
       " */\n"
-      "const methodInfo_$method_name$ = "
+      "const methodInfo_$service_name$_$method_name$ = "
       "new grpc.web.AbstractClientBase.MethodInfo(\n");
   printer->Indent();
   printer->Print(
@@ -674,7 +888,7 @@ void PrintUnaryCall(Printer* printer, std::map<string, string> vars) {
       "/**\n"
       " * @param {!proto.$in$} request The\n"
       " *     request proto\n"
-      " * @param {!Object<string, string>} metadata User defined\n"
+      " * @param {?Object<string, string>} metadata User defined\n"
       " *     call metadata\n"
       " * @param {function(?grpc.web.Error,"
       " ?proto.$out$)}\n"
@@ -699,8 +913,8 @@ void PrintUnaryCall(Printer* printer, std::map<string, string> vars) {
   printer->Print(
       vars,
       "request,\n"
-      "metadata,\n"
-      "methodInfo_$method_name$,\n"
+      "metadata || {},\n"
+      "methodInfo_$service_name$_$method_name$,\n"
       "callback);\n");
   printer->Outdent();
   printer->Outdent();
@@ -714,7 +928,7 @@ void PrintPromiseUnaryCall(Printer* printer,
                  "/**\n"
                  " * @param {!proto.$in$} request The\n"
                  " *     request proto\n"
-                 " * @param {!Object<string, string>} metadata User defined\n"
+                 " * @param {?Object<string, string>} metadata User defined\n"
                  " *     call metadata\n"
                  " * @return {!Promise<!proto.$out$>}\n"
                  " *     The XHR Node Readable Stream\n"
@@ -724,9 +938,10 @@ void PrintPromiseUnaryCall(Printer* printer,
   printer->Indent();
   printer->Print(vars,
                  "  function(request, metadata) {\n"
-                 "return new Promise((resolve, reject) => {\n"
-                 "  this.delegateClient_.$js_method_name$(\n"
-                 "    request, metadata, (error, response) => {\n"
+                 "var _this = this;\n"
+                 "return new Promise(function (resolve, reject) {\n"
+                 "  _this.delegateClient_.$js_method_name$(\n"
+                 "    request, metadata, function (error, response) {\n"
                  "      error ? reject(error) : resolve(response);\n"
                  "    });\n"
                  "});\n");
@@ -739,7 +954,7 @@ void PrintServerStreamingCall(Printer* printer, std::map<string, string> vars) {
       vars,
       "/**\n"
       " * @param {!proto.$in$} request The request proto\n"
-      " * @param {!Object<string, string>} metadata User defined\n"
+      " * @param {?Object<string, string>} metadata User defined\n"
       " *     call metadata\n"
       " * @return {!grpc.web.ClientReadableStream<!proto.$out$>}\n"
       " *     The XHR Node Readable Stream\n"
@@ -770,7 +985,7 @@ void PrintServerStreamingCall(Printer* printer, std::map<string, string> vars) {
       vars,
       "request,\n"
       "metadata,\n"
-      "methodInfo_$method_name$);\n");
+      "methodInfo_$service_name$_$method_name$);\n");
   printer->Outdent();
   printer->Outdent();
   printer->Outdent();
@@ -784,11 +999,6 @@ class GrpcCodeGenerator : public CodeGenerator {
 
   bool Generate(const FileDescriptor* file, const string& parameter,
                 GeneratorContext* context, string* error) const override {
-    if (!file->service_count()) {
-      // No services, nothing to do.
-      return true;
-    }
-
     std::vector<std::pair<string, string> > options;
     ParseGeneratorParameter(parameter, &options);
 
@@ -856,6 +1066,19 @@ class GrpcCodeGenerator : public CodeGenerator {
       return false;
     }
 
+    if (generate_dts || import_style == ImportStyle::TYPESCRIPT) {
+      string proto_dts_file_name = StripProto(file->name()) + "_pb.d.ts";
+      std::unique_ptr<ZeroCopyOutputStream> proto_dts_output(
+          context->Open(proto_dts_file_name));
+      Printer proto_dts_printer(proto_dts_output.get(), '$');
+      PrintProtoDtsFile(&proto_dts_printer, file);
+    }
+
+    if (!file->service_count()) {
+      // No services, nothing to do.
+      return true;
+    }
+
     std::unique_ptr<ZeroCopyOutputStream> output(
         context->Open(file_name));
     Printer printer(output.get(), '$');
@@ -863,13 +1086,6 @@ class GrpcCodeGenerator : public CodeGenerator {
 
     if (import_style == ImportStyle::TYPESCRIPT) {
       PrintTypescriptFile(&printer, file, vars);
-
-      string proto_dts_file_name = StripProto(file->name()) + "_pb.d.ts";
-      std::unique_ptr<ZeroCopyOutputStream> proto_dts_output(
-          context->Open(proto_dts_file_name));
-      Printer proto_dts_printer(proto_dts_output.get(), '$');
-      PrintProtoDtsFile(&proto_dts_printer, file);
-
       return true;
     }
 
@@ -979,12 +1195,6 @@ class GrpcCodeGenerator : public CodeGenerator {
       Printer grpcweb_dts_printer(grpcweb_dts_output.get(), '$');
 
       PrintGrpcWebDtsFile(&grpcweb_dts_printer, file);
-
-      std::unique_ptr<ZeroCopyOutputStream> proto_dts_output(
-          context->Open(proto_dts_file_name));
-      Printer proto_dts_printer(proto_dts_output.get(), '$');
-
-      PrintProtoDtsFile(&proto_dts_printer, file);
     }
 
     return true;
